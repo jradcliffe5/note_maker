@@ -14,8 +14,8 @@ SUPPLEMENT MODE (existing notes DOCX as first argument):
     python3 meeting_notes.py <notes.docx> [options]
 
 Options:
-    --captions FILE     Closed caption text file
-    --chat FILE         Chat log text file
+    --captions FILE [FILE] One or more closed caption text files
+    --chat FILE [FILE]     One or more chat log text files
     --audio FILE [FILE] One or more audio files (transcribed with mlx-whisper)
     --output FILE       Output DOCX path
                           generate: default meeting_notes.docx
@@ -87,12 +87,18 @@ def gather_sources(args):
     sources = {}
 
     if args.captions:
-        print(f"Reading captions: {args.captions}")
-        sources["Closed Captions"] = read_text_file(args.captions)
+        combined = []
+        for f in args.captions:
+            print(f"Reading captions: {f}")
+            combined.append(f"--- {Path(f).name} ---\n{read_text_file(f)}")
+        sources["Closed Captions"] = "\n\n".join(combined)
 
     if args.chat:
-        print(f"Reading chat: {args.chat}")
-        sources["Chat Log"] = read_text_file(args.chat)
+        combined = []
+        for f in args.chat:
+            print(f"Reading chat: {f}")
+            combined.append(f"--- {Path(f).name} ---\n{read_text_file(f)}")
+        sources["Chat Log"] = "\n\n".join(combined)
 
     if args.audio:
         combined = []
@@ -427,8 +433,8 @@ def main():
     )
     parser.add_argument("notes", nargs="?",
                         help="Existing meeting notes DOCX to supplement (omit to generate from scratch)")
-    parser.add_argument("--captions", help="Closed captions text file")
-    parser.add_argument("--chat",     help="Chat log text file")
+    parser.add_argument("--captions", nargs="+", help="Closed captions text file(s)")
+    parser.add_argument("--chat",     nargs="+", help="Chat log text file(s)")
     parser.add_argument("--audio", nargs="+", help="Audio files to transcribe")
     parser.add_argument("--output",   help="Output DOCX path")
     parser.add_argument("--title",    default="Meeting Notes",
