@@ -125,7 +125,7 @@ def gather_sources(args):
     return sources
 
 
-def _sources_block(sources, max_chars=40000):
+def _sources_block(sources, max_chars=400000):
     block = ""
     for label, content in sources.items():
         if content:
@@ -186,22 +186,136 @@ Rules:
 """
 
 
-def call_claude_generate(sources):
-    """Call Claude to produce meeting notes JSON from raw sources."""
-    prompt = f"{GENERATE_SYSTEM_PROMPT}\n\nSOURCE CONTENT:{_sources_block(sources)}\n\nPlease produce the meeting notes JSON object."
-    response = _run_claude(prompt)
+MAP_SYSTEM_PROMPT = """You are an expert scientific meeting secretary. You will receive ONE PORTION (a time-ordered segment) of a longer meeting's raw content — closed captions, chat, and/or audio transcript. This is not the whole meeting; earlier/later segments are handled separately.
+
+Your job: EXHAUSTIVELY extract every distinct topic discussed in THIS portion. Do NOT compress the meeting into a few high-level bullets — that loses detail. Err on the side of MORE agenda items with specific content rather than fewer summary items.
+
+Output a single JSON object:
+
+{
+  "attendees": ["names/identifiers that speak or are mentioned in this portion"],
+  "agenda_items": [
+    {
+      "heading": "Specific topic / proposal / agenda item title",
+      "discussion": "What was actually said — capture ALL specifics: proposal codes, grades, telescope names, frequencies, numbers, names, disagreements, rationale. Multiple sentences are fine.",
+      "decisions": ["Concrete decisions made"],
+      "action_items": [{"owner": "Name or 'TBD'", "action": "What they will do"}]
+    }
+  ],
+  "next_meeting": "Date/time of next meeting if mentioned here, else null"
+}
+
+Rules:
+- One agenda item per distinct topic/proposal. If ten proposals are discussed, produce ten items.
+- Preserve every proposal code, grade, telescope, and number exactly as spoken.
+- Do not editorialize or drop content for brevity. Completeness over concision.
+- Output JSON only, no preamble or trailing text.
+"""
+
+REDUCE_SUMMARY_PROMPT = """You are an expert meeting secretary. Below are the agenda-item headings extracted from a full meeting. Write a JSON object with a title and an executive summary.
+
+{
+  "title": "Concise, specific meeting title",
+  "summary": "3-6 sentence executive summary of the whole meeting"
+}
+
+Output JSON only.
+"""
+
+
+def _parse_json_object(response):
+    """Extract the first top-level JSON object from a Claude response."""
     if not response:
         return None
-    json_match = re.search(r'\{.*\}', response, re.DOTALL)
-    if json_match:
-        try:
-            return json.loads(json_match.group())
-        except json.JSONDecodeError as e:
-            print(f"  Warning: Could not parse Claude JSON: {e}", file=sys.stderr)
-            print(f"  Raw response (first 500 chars): {response[:500]}", file=sys.stderr)
-    else:
+    m = re.search(r'\{.*\}', response, re.DOTALL)
+    if not m:
         print("  Warning: No JSON object found in Claude response.", file=sys.stderr)
-    return None
+        return None
+    try:
+        return json.loads(m.group())
+    except json.JSONDecodeError as e:
+        print(f"  Warning: Could not parse Claude JSON: {e}", file=sys.stderr)
+        print(f"  Raw response (first 500 chars): {response[:500]}", file=sys.stderr)
+        return None
+
+
+def _chunk_text(text, chunk_chars=45000, overlap=2000):
+    """Split text into overlapping, time-ordered chunks."""
+    chunks = []
+    i = 0
+    n = len(text)
+    while i < n:
+        chunks.append(text[i:i + chunk_chars])
+        if i + chunk_chars >= n:
+            break
+        i += chunk_chars - overlap
+    return chunks
+
+
+# Above this many source chars, summarize in chunks so no single pass has to
+# compress the whole meeting (which silently drops per-topic detail).
+CHUNK_THRESHOLD = 55000
+
+
+def call_claude_generate(sources):
+    """Call Claude to produce meeting notes JSON from raw sources.
+
+    For long meetings, use map-reduce chunking so detail isn't lost to a single
+    over-compressed summarization pass.
+    """
+    block = _sources_block(sources)
+    if len(block) <= CHUNK_THRESHOLD:
+        prompt = f"{GENERATE_SYSTEM_PROMPT}\n\nSOURCE CONTENT:{block}\n\nPlease produce the meeting notes JSON object."
+        return _parse_json_object(_run_claude(prompt))
+
+    return _call_claude_generate_chunked(block)
+
+
+def _call_claude_generate_chunked(block):
+    """Map-reduce summarization for long meetings."""
+    chunks = _chunk_text(block)
+    print(f"  Long meeting ({len(block):,} chars): summarizing in {len(chunks)} chunks...")
+
+    all_items = []
+    attendees = []
+    next_meeting = None
+
+    for idx, chunk in enumerate(chunks, 1):
+        print(f"  Chunk {idx}/{len(chunks)} ...")
+        prompt = (
+            f"{MAP_SYSTEM_PROMPT}\n\n"
+            f"MEETING PORTION {idx} of {len(chunks)}:\n{chunk}\n\n"
+            f"Please produce the JSON object for THIS portion."
+        )
+        data = _parse_json_object(_run_claude(prompt))
+        if not data:
+            print(f"  Warning: chunk {idx} produced no usable output; skipping.", file=sys.stderr)
+            continue
+        all_items.extend(data.get("agenda_items", []) or [])
+        for a in data.get("attendees", []) or []:
+            if a and a not in attendees:
+                attendees.append(a)
+        next_meeting = next_meeting or data.get("next_meeting")
+
+    if not all_items:
+        print("  Warning: no agenda items extracted from any chunk.", file=sys.stderr)
+        return None
+
+    # Reduce: derive a title + overall summary from the collected headings.
+    headings = "\n".join(f"- {it.get('heading', '')}" for it in all_items if it.get("heading"))
+    summ = _parse_json_object(
+        _run_claude(f"{REDUCE_SUMMARY_PROMPT}\n\nAGENDA HEADINGS:\n{headings}\n\nProduce the JSON.")
+    ) or {}
+
+    return {
+        "title": summ.get("title"),
+        "date": None,
+        "attendees": attendees,
+        "summary": summ.get("summary", ""),
+        "agenda_items": all_items,
+        "other_notes": [],
+        "next_meeting": next_meeting,
+    }
 
 
 def build_docx_from_notes(data, meeting_date, meeting_title):
@@ -340,7 +454,7 @@ def call_claude_supplement(notes_text, sources):
     """Call Claude to produce insertion suggestions for an existing notes document."""
     prompt = (
         f"{SUPPLEMENT_SYSTEM_PROMPT}\n\n"
-        f"MEETING NOTES:\n{notes_text[:20000]}\n\n"
+        f"MEETING NOTES:\n{notes_text[:200000]}\n\n"
         f"SUPPLEMENTARY SOURCES:{_sources_block(sources)}\n\n"
         f"Please produce the JSON insertion list as described."
     )
