@@ -133,24 +133,42 @@ def _sources_block(sources, max_chars=400000):
     return block
 
 
-def _run_claude(prompt):
-    """Run the Claude CLI with the given prompt. Returns stdout or None on error."""
-    import shutil
+def _run_claude(prompt, attempts=4):
+    """Run the Claude CLI with the given prompt. Returns stdout or None on error.
+
+    Runs from the user's home directory: the prompt is passed via stdin, so the
+    working directory is irrelevant to the task, and home is a trusted workspace
+    (invoking from an untrusted dir, e.g. a cloud-synced folder, makes the CLI
+    reject the call). Retries once to absorb transient CLI failures.
+    """
+    import shutil, os, time
     if not shutil.which("claude"):
         print("  'claude' CLI not found. Ensure Claude Code is installed and on PATH.", file=sys.stderr)
         return None
     print("  Calling Claude CLI...")
-    result = subprocess.run(
-        ["claude", "-p"],
-        input=prompt,
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    if result.returncode != 0:
-        print(f"  Claude CLI error: {result.stderr.strip()}", file=sys.stderr)
-        return None
-    return result.stdout.strip()
+    home = os.path.expanduser("~")
+    for attempt in range(1, attempts + 1):
+        try:
+            result = subprocess.run(
+                ["claude", "-p"],
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=600,
+                cwd=home,
+            )
+        except subprocess.TimeoutExpired:
+            print("  Claude CLI timed out; skipping this call.", file=sys.stderr)
+            return None
+        if result.returncode == 0:
+            return result.stdout.strip()
+        err = result.stderr.strip() or "(no stderr — likely transient throttling)"
+        print(f"  Claude CLI error (attempt {attempt}/{attempts}): {err}", file=sys.stderr)
+        if attempt < attempts:
+            wait = 10 * attempt  # back off so the retry lands after throttling clears
+            print(f"  Waiting {wait}s before retry...")
+            time.sleep(wait)
+    return None
 
 
 # ── generate mode ─────────────────────────────────────────────────────────────
@@ -221,6 +239,80 @@ REDUCE_SUMMARY_PROMPT = """You are an expert meeting secretary. Below are the ag
 
 Output JSON only.
 """
+
+
+MERGE_PROMPT = """You are cleaning up meeting notes that were extracted from OVERLAPPING transcript chunks, so the SAME topic sometimes appears as several separate items. Below is a numbered list of agenda-item headings, each with a short snippet.
+
+Identify groups of items that describe the SAME real discussion, proposal, or event and should be combined into one. Group only genuine duplicates — e.g. the same proposal code, the same named person's proposal, or an identical event like a single coffee break split across a chunk boundary. Do NOT group merely related-but-distinct topics (two different proposals, two different station updates, etc.).
+
+Output JSON only, using the integer indices shown:
+{ "merge_groups": [[2, 5], [8, 9, 10]] }
+
+Items not listed in any group are kept as-is. If nothing should be merged, output {"merge_groups": []}.
+"""
+
+
+def _merge_agenda_items(items):
+    """Ask Claude which items are duplicates, then merge their content in Python.
+
+    Only merge-group indices come back from Claude; all field content is combined
+    locally so nothing is dropped or re-summarized.
+    """
+    if len(items) < 2:
+        return items
+
+    listing = "\n".join(
+        f"[{i}] {(it.get('heading') or '(no heading)')} :: {(it.get('discussion') or '')[:160]}"
+        for i, it in enumerate(items)
+    )
+    resp = _parse_json_object(
+        _run_claude(f"{MERGE_PROMPT}\n\nITEMS:\n{listing}\n\nProduce the JSON.")
+    ) or {}
+
+    # Validate groups: in-range integers, each index used at most once.
+    seen = set()
+    lead_of = {}
+    for group in resp.get("merge_groups") or []:
+        clean = [i for i in group if isinstance(i, int) and 0 <= i < len(items) and i not in seen]
+        if len(clean) >= 2:
+            seen.update(clean)
+            for i in clean:
+                lead_of[i] = clean[0]
+
+    if not lead_of:
+        return items
+
+    merged = {}
+    order = []
+    for i, it in enumerate(items):
+        lead = lead_of.get(i, i)
+        if lead not in merged:
+            merged[lead] = {"heading": "", "discussion": [], "decisions": [], "action_items": []}
+            order.append(lead)
+        m = merged[lead]
+        heading = it.get("heading") or ""
+        if len(heading) > len(m["heading"]):
+            m["heading"] = heading
+        disc = (it.get("discussion") or "").strip()
+        if disc and not any(disc in x or x in disc for x in m["discussion"]):
+            m["discussion"].append(disc)
+        for dec in it.get("decisions") or []:
+            if dec and dec not in m["decisions"]:
+                m["decisions"].append(dec)
+        for act in it.get("action_items") or []:
+            if act and act not in m["action_items"]:
+                m["action_items"].append(act)
+
+    result = []
+    for lead in order:
+        m = merged[lead]
+        result.append({
+            "heading": m["heading"],
+            "discussion": " ".join(m["discussion"]),
+            "decisions": m["decisions"],
+            "action_items": m["action_items"],
+        })
+    return result
 
 
 def _parse_json_object(response):
@@ -300,6 +392,13 @@ def _call_claude_generate_chunked(block):
     if not all_items:
         print("  Warning: no agenda items extracted from any chunk.", file=sys.stderr)
         return None
+
+    # Chunk overlap makes the same topic appear in adjacent chunks; merge dupes
+    # without re-summarizing (so no detail is lost).
+    before = len(all_items)
+    all_items = _merge_agenda_items(all_items)
+    if len(all_items) < before:
+        print(f"  Merged {before} items -> {len(all_items)} (removed {before - len(all_items)} duplicates).")
 
     # Reduce: derive a title + overall summary from the collected headings.
     headings = "\n".join(f"- {it.get('heading', '')}" for it in all_items if it.get("heading"))
